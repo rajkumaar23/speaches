@@ -1,0 +1,109 @@
+# ============================================================
+# STAGE 1: Build CTranslate2 (CUDA) + cp312 wheel for aarch64
+# ============================================================
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0 AS ctranslate2-builder
+
+# cuDNN dev headers are bundled in the jetpack image -- do NOT install
+# libcudnn9-dev-cuda-12 here (it would conflict / is redundant).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake git build-essential libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.10.0 /uv /bin/uv
+RUN uv python install 3.12
+
+WORKDIR /workspace
+RUN git clone --recursive --depth 1 --branch v4.5.0 https://github.com/OpenNMT/CTranslate2.git
+
+WORKDIR /workspace/CTranslate2/build
+RUN cmake -DWITH_CUDA=ON -DWITH_CUDNN=ON -DWITH_MKL=OFF -DWITH_OPENBLAS=ON \
+      -DOPENMP_RUNTIME=COMP -DCMAKE_CUDA_ARCHITECTURES=87 \
+      -DCMAKE_INSTALL_PREFIX=/opt/ctranslate2 .. \
+    && make -j2 \
+    && make install
+
+# Verify the core lib actually has CUDA (guard against silent CPU fallback)
+RUN python3 -c "import glob; f=glob.glob('/opt/ctranslate2/lib/libctranslate2.so') or glob.glob('/opt/ctranslate2/lib64/libctranslate2.so'); d=open(f[0],'rb').read(); assert b'cudnn' in d or b'cudart' in d or b'cublas' in d, 'CORE IS CPU - ABORT'; print('CORE HAS CUDA')"
+
+WORKDIR /workspace/CTranslate2/python
+ENV CTRANSLATE2_ROOT=/opt/ctranslate2
+RUN uv venv /workspace/venv --python 3.12 \
+    && uv pip install --python /workspace/venv/bin/python pybind11 setuptools wheel \
+    && CTRANSLATE2_ROOT=/opt/ctranslate2 /workspace/venv/bin/python setup.py bdist_wheel
+
+# Inspect wheel: list libctranslate2 member + CUDA-ness
+RUN /workspace/venv/bin/python -c "import zipfile,glob; [print(zf.namelist(), [(n, b'cudnn' in zf.read(n) or b'cudart' in zf.read(n) or b'cublas' in zf.read(n)) for n in zf.namelist() if 'libctranslate2' in n]) for w in glob.glob('/workspace/CTranslate2/python/dist/*.whl') for zf in [zipfile.ZipFile(w)]]"
+
+# ============================================================
+# STAGE 2: Runtime
+# ============================================================
+FROM nvcr.io/nvidia/l4t-cuda:12.6.11-runtime
+
+LABEL org.opencontainers.image.source="https://github.com/speaches-ai/speaches"
+LABEL org.opencontainers.image.licenses="MIT"
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates curl ffmpeg
+
+# Jetson apt repo + cuDNN runtime lib (libcudnn9-cuda-12 = 9.3.0.75 for r36.4)
+RUN echo "deb https://repo.download.nvidia.com/jetson/common r36.4 main" \
+    >> /etc/apt/sources.list.d/nvidia-l4t-apt-source.list && \
+    echo "deb https://repo.download.nvidia.com/jetson/t234 r36.4 main" \
+    >> /etc/apt/sources.list.d/nvidia-l4t-apt-source.list && \
+    apt-key adv --fetch-keys https://repo.download.nvidia.com/jetson/jetson-ota-public.asc && \
+    apt-get update && apt-get install -y --no-install-recommends libcudnn9-cuda-12 libopenblas0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash --uid 1000 ubuntu || true
+USER ubuntu
+ENV HOME=/home/ubuntu \
+    PATH=/home/ubuntu/.local/bin:$PATH \
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/home/ubuntu/.cache/uv \
+    UV_PYTHON_CACHE_DIR=/home/ubuntu/.cache/uv/python
+WORKDIR $HOME/speaches
+
+COPY --from=ghcr.io/astral-sh/uv:0.10.0 /uv /bin/uv
+
+RUN --mount=type=cache,target=/home/ubuntu/.cache/uv,uid=1000,gid=1000 \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --compile-bytecode --no-install-project --no-dev --python 3.12
+
+COPY --chown=ubuntu . .
+
+RUN --mount=type=cache,target=/home/ubuntu/.cache/uv,uid=1000,gid=1000 \
+    uv sync --frozen --compile-bytecode --no-dev --python 3.12
+
+# Install the CUDA-built wheel (uv pip), then force the CUDA core lib into the package
+COPY --from=ctranslate2-builder /workspace/CTranslate2/python/dist /tmp/wheels/
+COPY --from=ctranslate2-builder /opt/ctranslate2/lib/libctranslate2.so /tmp/libctranslate2.so
+ENV VIRTUAL_ENV=/home/ubuntu/speaches/.venv
+RUN uv pip install --python /home/ubuntu/speaches/.venv/bin/python \
+    --force-reinstall --no-deps /tmp/wheels/*.whl
+
+RUN /home/ubuntu/speaches/.venv/bin/python -c "import glob,shutil; libs=glob.glob('/home/ubuntu/speaches/.venv/lib/python3.12/site-packages/ctranslate2.libs/libctranslate2*.so'); pkg=glob.glob('/home/ubuntu/speaches/.venv/lib/python3.12/site-packages/ctranslate2*') + ['/tmp']; tgt=libs[0] if libs else pkg[0]+'/libctranslate2.so'; shutil.copyfile('/tmp/libctranslate2.so', tgt); print('CUDA lib ->', tgt)"
+
+RUN mkdir -p $HOME/.cache/huggingface/hub
+
+USER root
+RUN cp /tmp/libctranslate2.so /usr/local/lib/libctranslate2.so && \
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/ctranslate2.conf && \
+    find /home/ubuntu/speaches/.venv -maxdepth 8 -path "*/nvidia/*/lib" -type d \
+        > /etc/ld.so.conf.d/venv-nvidia.conf && \
+    ldconfig
+USER ubuntu
+
+ENV UVICORN_HOST=0.0.0.0
+ENV UVICORN_PORT=8000
+ENV PATH="$HOME/speaches/.venv/bin:$PATH"
+ENV DO_NOT_TRACK=1
+ENV GRADIO_ANALYTICS_ENABLED="False"
+ENV DISABLE_TELEMETRY=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
+ENV PYANNOTE_METRICS_ENABLED=0
+ENV STT_MODEL_TTL=-1   # never auto-offload STT model; keep in memory until another model loads
+
+EXPOSE 8000
+CMD ["uvicorn", "--factory", "speaches.main:create_app"]
